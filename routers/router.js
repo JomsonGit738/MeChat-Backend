@@ -13,6 +13,10 @@ router.post('/login', userController.login)
 
 router.post('/googlesignin', userController.googlesignin)
 
+router.post('/logout', userController.logout)
+
+router.get('/session', authware.checkAuth, userController.session)
+
 //token
 router.get('/search-user', authware.checkAuth, userController.searchUser)
 

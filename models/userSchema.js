@@ -12,8 +12,22 @@ const userSchema = mongoose.Schema({
     },
     password: {
         type: String,
-        required: true,
-        default: "#23Gsin"
+        select: false,
+        required: function () {
+            return this.authProvider === "local"
+        }
+    },
+    authProvider: {
+        type: String,
+        enum: ["local", "google"],
+        default: "local",
+        required: true
+    },
+    googleSub: {
+        type: String,
+        select: false,
+        unique: true,
+        sparse: true
     },
     url: {
         type: String,
@@ -23,7 +37,7 @@ const userSchema = mongoose.Schema({
     mobile: {
         type: String,
         required: true,
-        default: "#45Gauth"
+        default: "not-provided"
     },
     mychats: [
         {

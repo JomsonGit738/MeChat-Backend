@@ -1,15 +1,31 @@
 const users = require('../models/userSchema')
 const chats = require('../models/chatSchema')
 const messages = require('../models/messageSchema')
-const generateToken = require('../configuration/token')
+const bcrypt = require('bcryptjs')
+const mongoose = require('mongoose')
+const {
+    clearSessionCookie,
+    setSessionCookie,
+    toPublicUser,
+    verifyGoogleCredential
+} = require('../configuration/auth')
+
+const normalizeEmail = (email = "") => email.trim().toLowerCase()
+const escapeRegex = (value = "") => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+const publicUserFields = "-password -mobile -mychats -googleSub -authProvider"
+
+const findAuthorizedChat = (chatId, userId) => {
+    if (!mongoose.isValidObjectId(chatId)) return null
+    return chats.findOne({ _id: chatId, users: userId })
+}
 
 
 //checking whether the Email exits or not
 exports.uniqueEmail = async (req, res) => {
-    const { email } = req.body
+    const email = normalizeEmail(req.body.email)
     const preuser = await users.findOne({ email })
     if (preuser) {
-        res.status(210).json("This email is already in use. use another email")
+        res.status(409).json("Unable to use this email")
     } else {
         res.status(200).json('unique email')
     }
@@ -17,25 +33,37 @@ exports.uniqueEmail = async (req, res) => {
 
 //register user by creating an account
 exports.register = async (req, res) => {
+    const username = req.body.username?.trim()
+    const email = normalizeEmail(req.body.email)
+    const { password } = req.body
 
+    if (
+        !username ||
+        username.length > 50 ||
+        !email ||
+        email.length > 254 ||
+        !password ||
+        password.length < 8 ||
+        password.length > 128
+    ) {
+        return res.status(400).json("Invalid registration details")
+    }
 
-    const { username, email, password, url, mobile } = req.body
     try {
         const preuser = await users.findOne({ email })
         if (preuser) {
-
-            res.status(200).json(preuser)
+            // Never return an existing account document; it may contain private fields.
+            return res.status(409).json("Unable to create account")
         } else {
             const newUser = new users({
                 username,
                 email,
-                password,
-                url,
-                mobile,
+                password: await bcrypt.hash(password, 12),
+                authProvider: "local",
                 mychats: []
             })
             await newUser.save()
-            res.status(200).json(newUser)
+            res.status(201).json(toPublicUser(newUser))
         }
 
 
@@ -47,22 +75,35 @@ exports.register = async (req, res) => {
 
 //login user 
 exports.login = async (req, res) => {
-    const { email, password } = req.body
-    try {
-        const user = await users.findOne({ email, password })
+    const email = normalizeEmail(req.body.email)
+    const { password } = req.body
 
-        if (user) {
-            res.status(200).json(
-                {
-                    id: user._id,
-                    url: user.url,
-                    username: user.username,
-                    email: user.email,
-                    token: generateToken(user._id)
+    if (!email || email.length > 254 || !password || password.length > 128) {
+        return res.status(400).json("Email and password are required")
+    }
+
+    try {
+        const user = await users.findOne({ email }).select("+password")
+        let passwordMatches = false
+
+        if (user?.password && user.password !== "#23Gsin") {
+            if (user.password.startsWith("$2")) {
+                passwordMatches = await bcrypt.compare(password, user.password)
+            } else {
+                // Transparently migrate legacy plaintext passwords after a valid login.
+                passwordMatches = password === user.password
+                if (passwordMatches) {
+                    user.password = await bcrypt.hash(password, 12)
+                    await user.save()
                 }
-            )
+            }
+        }
+
+        if (user && passwordMatches && user.authProvider !== "google") {
+            setSessionCookie(res, user._id)
+            res.status(200).json(toPublicUser(user))
         } else {
-            res.status(404).json("wrong Email or password!")
+            res.status(401).json("Invalid email or password")
         }
     }
     catch (err) {
@@ -72,60 +113,81 @@ exports.login = async (req, res) => {
 
 //Google Sign in
 exports.googlesignin = async (req, res) => {
-
-
-    const { username, email, password, url, mobile } = req.body
     try {
-        //if user exists
-        const user = await users.findOne({ email })
-        if (user) {
-            res.status(200).json(
-                {
-                    id: user._id,
-                    url: user.url,
-                    username: user.username,
-                    email: user.email,
-                    token: generateToken(user._id)
-                }
-            )
-        }
-        //if new user signing in
-        else {
-            const newUser = new users({
-                username,
-                email,
-                password,
-                url,
-                mobile,
-                mychats: []
-            })
-            await newUser.save()
-            res.status(200).json(
-                {
-                    id: newUser._id,
-                    url: newUser.url,
-                    username: newUser.username,
-                    email: newUser.email,
-                    token: generateToken(newUser._id)
-                }
-            )
+        if (!req.body.credential) {
+            return res.status(400).json("Google credential is required")
         }
 
+        // Verification checks Google's signature, issuer, audience and expiry.
+        const payload = await verifyGoogleCredential(req.body.credential)
+        if (!payload?.sub || !payload?.email || !payload.email_verified) {
+            return res.status(401).json("Google account could not be verified")
+        }
 
+        const email = normalizeEmail(payload.email)
+        let user = await users.findOne({ googleSub: payload.sub }).select("+password")
+
+        if (!user) {
+            const accountWithEmail = await users.findOne({ email }).select("+password")
+
+            if (accountWithEmail) {
+                const isLegacyGoogleAccount = accountWithEmail.password === "#23Gsin"
+                if (!isLegacyGoogleAccount && accountWithEmail.authProvider !== "google") {
+                    return res.status(409).json(
+                        "An account already exists for this email. Sign in with its password first."
+                    )
+                }
+
+                // Safely migrate accounts created by the old unverified Google flow.
+                accountWithEmail.authProvider = "google"
+                accountWithEmail.googleSub = payload.sub
+                accountWithEmail.password = undefined
+                accountWithEmail.username = payload.name || accountWithEmail.username
+                accountWithEmail.url = payload.picture || accountWithEmail.url
+                user = await accountWithEmail.save()
+            } else {
+                user = await users.create({
+                    username: payload.name || "Google user",
+                    email,
+                    url: payload.picture,
+                    authProvider: "google",
+                    googleSub: payload.sub,
+                    mobile: "not-provided",
+                    mychats: []
+                })
+            }
+        } else {
+            user.username = payload.name || user.username
+            user.url = payload.picture || user.url
+            await user.save()
+        }
+
+        setSessionCookie(res, user._id)
+        res.status(200).json(toPublicUser(user))
     } catch (error) {
-        console.log(error);
-        res.status(401).json(error)
+        console.error("Google sign-in verification failed:", error.message)
+        res.status(401).json("Google sign-in could not be verified")
     }
+}
+
+exports.logout = (req, res) => {
+    clearSessionCookie(res)
+    res.status(204).send()
+}
+
+exports.session = (req, res) => {
+    res.status(200).json(toPublicUser(req.user))
 }
 
 //search user
 exports.searchUser = async (req, res) => {
     try {
-        const keyword = req.query.search
+        const search = escapeRegex(String(req.query.search || "").slice(0, 100))
+        const keyword = search
             ? {
                 $or: [
-                    { username: { $regex: req.query.search, $options: "i" } },
-                    { email: { $regex: req.query.search, $options: "i" } }
+                    { username: { $regex: search, $options: "i" } },
+                    { email: { $regex: search, $options: "i" } }
                 ]
             }
             : {}
@@ -135,7 +197,7 @@ exports.searchUser = async (req, res) => {
         //$ne = not equal to
         const result = await users.find(keyword).find(
             { _id: { $ne: req.user._id } }
-        )
+        ).select(publicUserFields).limit(25)
         res.status(200).json(result)
 
     } catch (err) {
@@ -150,9 +212,11 @@ exports.searchUser = async (req, res) => {
 exports.accessChat = async (req, res) => {
     const { userId } = req.body
 
-    if (!userId) {
-        //console.log('no userId found for accessChat');
-        return res.sendStatus(400)
+    if (!mongoose.isValidObjectId(userId) || userId === req.user._id.toString()) {
+        return res.status(400).json("Invalid user")
+    }
+    if (!await users.exists({ _id: userId })) {
+        return res.status(404).json("User not found")
     }
 
     var isChat = await chats.find(
@@ -163,7 +227,7 @@ exports.accessChat = async (req, res) => {
                 { users: { $elemMatch: { $eq: userId } } }
             ]
         }
-    ).populate("users", "-password")
+    ).populate("users", publicUserFields)
         .populate('latestMessage')
 
     isChat = await users.populate(isChat, {
@@ -217,7 +281,7 @@ exports.accessChat = async (req, res) => {
 
             //101 12-02-2023
             const FullChat = await chats.findOne({ _id: createChat._id })
-                .populate("users", "-password")
+                .populate("users", publicUserFields)
 
             res.status(200).json(FullChat)
         } catch (err) {
@@ -246,7 +310,7 @@ exports.fetchChat = async (req, res) => {
             const binder = await chats.find({ _id: { $in: userChats } })
                 .populate({
                     path: "users",
-                    select: "-password -mobile"
+                    select: publicUserFields
                 })
                 .populate("latestMessage")
                 .sort({ updatedAt: -1 })
@@ -271,14 +335,20 @@ exports.sendMessages = async (req, res) => {
 
     const { content, chatId } = req.body
 
-    if (!content || !chatId) {
-        console.log('no content OR no chatId');
-        res.status(401).json('no content OR chatId found')
+    if (typeof content !== "string" || !content.trim() || content.length > 4000) {
+        return res.status(400).json('Message must contain 1 to 4000 characters')
     }
+
     try {
+        // Authentication alone is insufficient: the sender must belong to the chat.
+        const chat = await findAuthorizedChat(chatId, req.user._id)
+        if (!chat) {
+            return res.status(403).json("You do not have access to this chat")
+        }
+
         var mess = await messages.create({
             sender: req.user._id,
-            content: content,
+            content: content.trim(),
             chat: chatId
         })
 
@@ -294,6 +364,17 @@ exports.sendMessages = async (req, res) => {
             latestMessage: mess
         })
 
+        // Broadcast only the message that was authenticated, validated, and
+        // persisted above. The browser cannot choose recipients or relay data.
+        const io = req.app.get("io")
+        mess.chat.users.forEach((user) => {
+            if (user._id.toString() !== req.user._id.toString()) {
+                io.to(user._id.toString()).emit("message received", {
+                    newMessageReceived: mess
+                })
+            }
+        })
+
         res.status(200).json(mess)
 
     } catch (error) {
@@ -307,6 +388,10 @@ exports.sendMessages = async (req, res) => {
 //messages of the chats
 exports.allMessages = async (req, res) => {
     try {
+        const chat = await findAuthorizedChat(req.params.chatId, req.user._id)
+        if (!chat) {
+            return res.status(403).json("You do not have access to this chat")
+        }
 
         const mess =
             await messages.find({ chat: req.params.chatId })
@@ -359,38 +444,63 @@ exports.removeUser = async (req, res) => {
 exports.createGroupChat = async (req, res) => {
 
     if (!req.body.name || !req.body.users) {
-        res.status(401).json("Empty field found!")
+        return res.status(400).json("Group name and users are required")
     }
 
-    const userIdsToUpdate = [...JSON.parse(req.body.users), req.user._id.toString()];
-    const usersData = JSON.parse(req.body.users)
-    usersData.push(req.user) //object
+    let parsedUsers
+    try {
+        parsedUsers = JSON.parse(req.body.users)
+    } catch {
+        return res.status(400).json("Group users must be a valid list")
+    }
+
+    const name = String(req.body.name).trim()
+    if (!Array.isArray(parsedUsers) || !name || name.length > 80 || parsedUsers.length > 50) {
+        return res.status(400).json("Invalid group details")
+    }
+
+    // The authenticated creator is added by the server, never trusted from input.
+    const uniqueUserIds = [...new Set(parsedUsers)].filter(
+        (id) => id !== req.user._id.toString()
+    )
+    if (
+        uniqueUserIds.length === 0 ||
+        uniqueUserIds.some((id) => !mongoose.isValidObjectId(id))
+    ) {
+        return res.status(400).json("Add at least one valid group member")
+    }
 
     try {
+        const existingUserCount = await users.countDocuments({ _id: { $in: uniqueUserIds } })
+        if (existingUserCount !== uniqueUserIds.length) {
+            return res.status(400).json("One or more group members do not exist")
+        }
+
+        const userIdsToUpdate = [...uniqueUserIds, req.user._id.toString()]
 
         const newGroup = await chats.create({
-            chatName: req.body.name,
-            users: usersData,
+            chatName: name,
+            users: userIdsToUpdate,
             isGroupChat: true,
-            groupAdmin: req.user
+            groupAdmin: req.user._id
 
         })
 
         //push chat id to all users in the Group
         await users.updateMany(
             { _id: { $in: userIdsToUpdate } }, // Filter by user IDs in the array
-            { $push: { mychats: newGroup._id } })
+            { $addToSet: { mychats: newGroup._id } })
 
 
         const GroupChat = await chats.findOne({ _id: newGroup._id })
-            .populate("users", "-password")
-            .populate("groupAdmin", "-password")
+            .populate("users", publicUserFields)
+            .populate("groupAdmin", publicUserFields)
 
         res.status(200).json(GroupChat)
 
     } catch (error) {
         console.log(error)
-        res.status(401).json(error)
+        res.status(500).json("Unable to create group")
     }
 
 }
@@ -398,21 +508,25 @@ exports.createGroupChat = async (req, res) => {
 exports.renameGroupChat = async (req, res) => {
     const { chatId, chatName } = req.body;
 
-    const updatedChat = await chats.findByIdAndUpdate(
-        chatId,
+    if (!mongoose.isValidObjectId(chatId) || !chatName?.trim() || chatName.length > 80) {
+        return res.status(400).json("Invalid group details")
+    }
+
+    // The database filter enforces admin authorization atomically with the update.
+    const updatedChat = await chats.findOneAndUpdate(
+        { _id: chatId, isGroupChat: true, groupAdmin: req.user._id },
         {
-            chatName: chatName,
+            chatName: chatName.trim(),
         },
         {
             new: true,
         }
     )
-        .populate("users", "-password")
-        .populate("groupAdmin", "-password");
+        .populate("users", publicUserFields)
+        .populate("groupAdmin", publicUserFields);
 
     if (!updatedChat) {
-        res.status(404);
-        throw new Error("Chat Not Found");
+        return res.status(403).json("Only the group administrator can rename this group")
     } else {
         res.json(updatedChat);
     }
@@ -421,9 +535,21 @@ exports.renameGroupChat = async (req, res) => {
 exports.deleteUserFromGroup = async (req, res) => {
     const { userId, chatId } = req.body
 
+    if (!mongoose.isValidObjectId(userId) || !mongoose.isValidObjectId(chatId)) {
+        return res.status(400).json("Invalid group or user")
+    }
+    if (userId === req.user._id.toString()) {
+        return res.status(400).json("Use leave group to remove your own account")
+    }
+
     try {
-        const removed = await chats.findByIdAndUpdate(
-            chatId,
+        const removed = await chats.findOneAndUpdate(
+            {
+                _id: chatId,
+                isGroupChat: true,
+                groupAdmin: req.user._id,
+                users: userId
+            },
             {
                 $pull: { users: userId },
             },
@@ -431,18 +557,15 @@ exports.deleteUserFromGroup = async (req, res) => {
                 new: true,
             }
         )
-            .populate("users", "-password")
-            .populate("groupAdmin", "-password");
-
-        //remove chatid from user mychat array    
-        await users.findOneAndUpdate(
-            { _id: userId },
-            { $pull: { mychats: chatId } })
+            .populate("users", publicUserFields)
+            .populate("groupAdmin", publicUserFields);
 
         if (!removed) {
-            res.status(404);
-            throw new Error("Chat Not Found");
+            return res.status(403).json("Only the group administrator can remove members")
         } else {
+            await users.findOneAndUpdate(
+                { _id: userId },
+                { $pull: { mychats: chatId } })
             res.status(200).json(removed);
         }
     }
@@ -458,11 +581,12 @@ exports.deleteUserFromGroup = async (req, res) => {
 exports.searchAddUserforGroup = async (req, res) => {
 
     try {
-        const keyword = req.query.search
+        const search = escapeRegex(String(req.query.search || "").slice(0, 100))
+        const keyword = search
             ? {
                 $or: [
-                    { username: { $regex: req.query.search, $options: "i" } },
-                    { email: { $regex: req.query.search, $options: "i" } }
+                    { username: { $regex: search, $options: "i" } },
+                    { email: { $regex: search, $options: "i" } }
                 ],
                 _id: { $ne: req.user._id }
             }
@@ -472,7 +596,7 @@ exports.searchAddUserforGroup = async (req, res) => {
         //users found when token checking => authware.js => req.user
         //$ne = not equal to data
 
-        const result = await users.findOne(keyword).select('-password -mobile -mychats')
+        const result = await users.findOne(keyword).select(publicUserFields)
 
         res.status(200).json(result)
 
@@ -488,28 +612,29 @@ exports.searchAddUserforGroup = async (req, res) => {
 exports.addNewUserToGroup = async (req, res) => {
     const { userId, chatId } = req.body
 
+    if (!mongoose.isValidObjectId(userId) || !mongoose.isValidObjectId(chatId)) {
+        return res.status(400).json("Invalid group or user")
+    }
+
     try {
-        const added = await chats.findByIdAndUpdate(
-            chatId,
+        const added = await chats.findOneAndUpdate(
+            { _id: chatId, isGroupChat: true, groupAdmin: req.user._id },
             {
-                $push: { users: userId },
+                $addToSet: { users: userId },
             },
             {
                 new: true,
             }
         )
-            .populate("users", "-password")
-            .populate("groupAdmin", "-password");
-
-        //add chatid to user mychat array    
-        await users.findOneAndUpdate(
-            { _id: userId },
-            { $push: { mychats: chatId } })
+            .populate("users", publicUserFields)
+            .populate("groupAdmin", publicUserFields);
 
         if (!added) {
-            res.status(404);
-            throw new Error("Chat Not Found");
+            return res.status(403).json("Only the group administrator can add members")
         } else {
+            await users.findOneAndUpdate(
+                { _id: userId },
+                { $addToSet: { mychats: chatId } })
             res.status(200).json(added);
         }
     }
@@ -520,68 +645,53 @@ exports.addNewUserToGroup = async (req, res) => {
 }
 
 exports.leaveGroupChat = async (req, res) => {
-    const { chatId, userId, isAdmin, newAdmin } = req.body
-    if (!chatId || !userId || !newAdmin) {
-        res.status(404).json('Chat Not Found');
-    } else {
-
-        try {
-            if (isAdmin) {
-                const adminremoved = await chats.findByIdAndUpdate(
-                    chatId,
-                    {
-                        $pull: { users: userId },
-                    },
-                    {
-                        new: true,
-                    }
-                )
-                adminremoved.groupAdmin = newAdmin
-                await adminremoved.save()
-
-                await users.findOneAndUpdate(
-                    { _id: userId },
-                    { $pull: { mychats: chatId } })
-
-                if (!adminremoved) {
-                    res.status(404).json('Chat Not Found');
-                } else {
-                    res.status(200).json(adminremoved);
-                }
-
-            }
-            else {
-                const removed = await chats.findByIdAndUpdate(
-                    chatId,
-                    {
-                        $pull: { users: userId },
-                    },
-                    {
-                        new: true,
-                    }
-                )
-                    .populate("users", "-password")
-                    .populate("groupAdmin", "-password");
-
-                //remove chatid from user mychat array    
-                await users.findOneAndUpdate(
-                    { _id: userId },
-                    { $pull: { mychats: chatId } })
-
-                if (!removed) {
-                    res.status(404).json('Chat Not Found');
-                } else {
-                    res.status(200).json(removed);
-                }
-            }
-
-        } catch (error) {
-            console.log(error)
-            res.status(401).json(error)
-
-        }
-
-
+    const { chatId } = req.body
+    if (!mongoose.isValidObjectId(chatId)) {
+        return res.status(400).json("Invalid group")
     }
 
+    try {
+        // User identity and admin status come from verified server state, not the request.
+        const group = await chats.findOne({
+            _id: chatId,
+            isGroupChat: true,
+            users: req.user._id
+        })
+        if (!group) {
+            return res.status(403).json("You are not a member of this group")
+        }
+
+        const remainingMembers = group.users.filter(
+            (id) => id.toString() !== req.user._id.toString()
+        )
+
+        if (remainingMembers.length === 0) {
+            await chats.deleteOne({ _id: group._id })
+            await messages.deleteMany({ chat: group._id })
+            await users.updateOne(
+                { _id: req.user._id },
+                { $pull: { mychats: group._id } }
+            )
+            return res.status(204).send()
+        }
+
+        const update = { $pull: { users: req.user._id } }
+        if (group.groupAdmin?.toString() === req.user._id.toString()) {
+            update.$set = { groupAdmin: remainingMembers[0] }
+        }
+
+        const updatedGroup = await chats.findByIdAndUpdate(group._id, update, { new: true })
+            .populate("users", publicUserFields)
+            .populate("groupAdmin", publicUserFields)
+
+        await users.updateOne(
+            { _id: req.user._id },
+            { $pull: { mychats: group._id } }
+        )
+
+        res.status(200).json(updatedGroup)
+    } catch (error) {
+        console.error(error)
+        res.status(500).json("Unable to leave group")
+    }
 }
